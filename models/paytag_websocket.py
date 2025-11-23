@@ -124,62 +124,161 @@ class PaytagWebsocketService(models.AbstractModel):
         except Exception:
             _logger.exception("Failed to process payload: %s", payload)
 
-    def _process_message(self, env, payload):
-        """
-        Parse payload and create/update session/items.
-        This will be executed inside a DB cursor context when invoked from the thread.
-        """
-        # Minimal routing based on document spec
-        # 1) ACTION barcode
-        if payload.get('type') == 'barcode':
-            action = payload.get('action')
-            item = payload.get('item') or {}
-            rfid = item.get('rfid') or ''
-            barcode = item.get('barcode') or ''
-            # Find active session or create one (simple logic: last session not done)
-            Session = env['paytag.session'].sudo()
-            session = Session.search([('state', 'in', ['waiting', 'scanning'])], limit=1, order='start_time desc')
-            if not session:
-                session = Session.create({'name': f"session-{datetime.now().strftime('%Y%m%d%H%M%S')}", 'state': 'scanning'})
-            # Create or update item
-            Item = env['paytag.item'].sudo()
-            existing = Item.search([('rfid', '=', rfid), ('session_id', '=', session.id)], limit=1) if rfid else Item.search([('barcode','=',barcode),('session_id','=',session.id)], limit=1)
-            vals = {
-                'rfid': rfid,
-                'barcode': barcode,
-                'status': 'added' if action == 'added' else 'removed',
-                'session_id': session.id,
-                'last_seen': fields.Datetime.now()
-            }
-            if existing:
-                existing.write(vals)
-            else:
-                vals['first_seen'] = fields.Datetime.now()
-                Item.create(vals)
-            # Update session state
-            if session.state != 'scanning':
-                session.sudo().write({'state': 'scanning'})
-            _logger.info("Processed barcode action: %s (rfid=%s barcode=%s)", action, rfid, barcode)
+    # def _process_message(self, env, payload):
+    #     """
+    #     Parse payload and create/update session/items.
+    #     This will be executed inside a DB cursor context when invoked from the thread.
+    #     """
+    #     # Minimal routing based on document spec
+    #     # 1) ACTION barcode
+    #     if payload.get('type') == 'barcode':
+    #         action = payload.get('action')
+    #         item = payload.get('item') or {}
+    #         rfid = item.get('rfid') or ''
+    #         barcode = item.get('barcode') or ''
+    #         # Find active session or create one (simple logic: last session not done)
+    #         Session = env['paytag.session'].sudo()
+    #         session = Session.search([('state', 'in', ['waiting', 'scanning'])], limit=1, order='start_time desc')
+    #         if not session:
+    #             session = Session.create({'name': f"session-{datetime.now().strftime('%Y%m%d%H%M%S')}", 'state': 'scanning'})
+    #         # Create or update item
+    #         Item = env['paytag.item'].sudo()
+    #         existing = Item.search([('rfid', '=', rfid), ('session_id', '=', session.id)], limit=1) if rfid else Item.search([('barcode','=',barcode),('session_id','=',session.id)], limit=1)
+    #         vals = {
+    #             'rfid': rfid,
+    #             'barcode': barcode,
+    #             'status': 'added' if action == 'added' else 'removed',
+    #             'session_id': session.id,
+    #             'last_seen': fields.Datetime.now()
+    #         }
+    #         if existing:
+    #             existing.write(vals)
+    #         else:
+    #             vals['first_seen'] = fields.Datetime.now()
+    #             Item.create(vals)
+    #         # Update session state
+    #         if session.state != 'scanning':
+    #             session.sudo().write({'state': 'scanning'})
+    #         _logger.info("Processed barcode action: %s (rfid=%s barcode=%s)", action, rfid, barcode)
 
-        # 2) Neutralizer type action
-        elif payload.get('type') == 'neutralizer':
-            # payload example: {'type':'neutralizer','action':'tag','status':211,'items':{...},'message':...}
-            action = payload.get('action')
-            items = payload.get('items') or {}
-            barcode = items.get('barcode') if isinstance(items, dict) else None
-            Item = env['paytag.item'].sudo()
-            if barcode:
-                found = Item.search([('barcode', '=', barcode)], limit=1)
-                if found:
-                    found.sudo().write({'status': 'neutralized'})
-            _logger.info("Neutralizer action processed: %s, barcode=%s", action, barcode)
+    #     # 2) Neutralizer type action
+    #     elif payload.get('type') == 'neutralizer':
+    #         # payload example: {'type':'neutralizer','action':'tag','status':211,'items':{...},'message':...}
+    #         action = payload.get('action')
+    #         items = payload.get('items') or {}
+    #         barcode = items.get('barcode') if isinstance(items, dict) else None
+    #         Item = env['paytag.item'].sudo()
+    #         if barcode:
+    #             found = Item.search([('barcode', '=', barcode)], limit=1)
+    #             if found:
+    #                 found.sudo().write({'status': 'neutralized'})
+    #         _logger.info("Neutralizer action processed: %s, barcode=%s", action, barcode)
 
-        # 3) Info / status messages
-        elif payload.get('type') == 'info' or 'status' in payload:
-            _logger.info("Info/status from Paytag: %s", payload)
+    #     # 3) Info / status messages
+    #     elif payload.get('type') == 'info' or 'status' in payload:
+    #         _logger.info("Info/status from Paytag: %s", payload)
 
+    #     else:
+    #         _logger.debug("Unhandled payload: %s", payload)
+
+
+
+def _process_message(self, env, payload):
+    """
+    Parse payload and create/update session/items.
+    This will be executed inside a DB cursor context when invoked from the thread.
+    """
+    # 1) ACTION barcode
+    if payload.get('type') == 'barcode':
+        action = payload.get('action')
+        item = payload.get('item') or {}
+        rfid = item.get('rfid') or ''
+        barcode = item.get('barcode') or ''
+
+        if not rfid and not barcode:
+            _logger.warning("Barcode message without rfid and barcode: %s", payload)
+            return
+
+        Session = env['paytag.session'].sudo()
+        Item = env['paytag.item'].sudo()
+        Product = env['product.product'].sudo()
+
+        # Find active session or create one (simple logic: last session not done)
+        session = Session.search(
+            [('state', 'in', ['waiting', 'scanning'])],
+            limit=1,
+            order='start_time desc'
+        )
+        if not session:
+            session = Session.create({
+                'name': f"session-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                'state': 'scanning',
+            })
+
+        # 🔍 Try to find product by barcode
+        product = False
+        if barcode:
+            product = Product.search([('barcode', '=', barcode)], limit=1)
+
+        # Create or update item
+        if rfid:
+            existing = Item.search([
+                ('rfid', '=', rfid),
+                ('session_id', '=', session.id)
+            ], limit=1)
         else:
-            _logger.debug("Unhandled payload: %s", payload)
+            existing = Item.search([
+                ('barcode', '=', barcode),
+                ('session_id', '=', session.id)
+            ], limit=1)
+
+        vals = {
+            'rfid': rfid,
+            'barcode': barcode,
+            'status': 'added' if action == 'added' else 'removed',
+            'session_id': session.id,
+            'last_seen': fields.Datetime.now(),
+        }
+
+        # 📦 Attach product to item if found
+        if product:
+            vals['product_id'] = product.id
+
+        if existing:
+            existing.write(vals)
+        else:
+            vals['first_seen'] = fields.Datetime.now()
+            Item.create(vals)
+
+        # Update session state
+        if session.state != 'scanning':
+            session.sudo().write({'state': 'scanning'})
+
+        _logger.info(
+            "Processed barcode action: %s (rfid=%s barcode=%s, product_id=%s)",
+            action, rfid, barcode, product.id if product else None
+        )
+
+    # 2) Neutralizer type action
+    elif payload.get('type') == 'neutralizer':
+        # payload example: {'type':'neutralizer','action':'tag','status':211,'items':{...},'message':...}
+        action = payload.get('action')
+        items = payload.get('items') or {}
+        barcode = items.get('barcode') if isinstance(items, dict) else None
+        Item = env['paytag.item'].sudo()
+        if barcode:
+            found = Item.search([('barcode', '=', barcode)], limit=1)
+            if found:
+                found.sudo().write({'status': 'neutralized'})
+        _logger.info("Neutralizer action processed: %s, barcode=%s", action, barcode)
+
+    # 3) Info / status messages
+    elif payload.get('type') == 'info' or 'status' in payload:
+        _logger.info("Info/status from Paytag: %s", payload)
+
+    else:
+        _logger.debug("Unhandled payload: %s", payload)
+
 
     @api.model
     def send_command(self, command_dict):
